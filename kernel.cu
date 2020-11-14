@@ -8,7 +8,7 @@
 #include <time.h>
 #include <windows.h>
 #include <math.h>
-#include <vector>			//Standard template library class
+#include <vector>			//Standard template library classTESS_NUM
 #include <iostream>
 
 #include <GL/glew.h>
@@ -46,22 +46,23 @@ float cam_v = 0.0f;
 float cam_d = 2.0f * box_size;
 
 // param
-const int MAX_DENSITY = 10;
-const int MAX_SEG_NUM = 50;
-const int MAX_TESS = (MAX_DENSITY + 1) * (MAX_DENSITY + 2) / 2;
+const int TRIANGLE_NUM = 960;
+const int DENSITY = 3;// 8;
+const int MAX_SEG_NUM = 80;
+const int TESS_NUM = 10;// 45;
 const float HAIR_DIA = 0.001f;
 
-int hair_density = 1;
-float hair_seg_length = 0.03f;
-int hair_seg_num = 10;
-float hair_stiff = 3.0f;
-float gravity = 0.0f;
-float damping = 0.01f;
+float hair_seg_length = 0.01f;
+int hair_seg_num = MAX_SEG_NUM;
+float hair_stiff = 20.0f;
+float gravity = 0.03f;
+float damping = 0.002f;
 float wind[3] = { 0.0f, 0.0f, 0.0f };
 
 bool sphere_force = false;
 float sphere_center[3] = { 0.0f, 0.0f, 0.0f };
 float sphere_v[3] = { 0.0f, 0.0f, 0.0f };
+float const sphere_weight = 20.0f;
 
 std::vector<glm::vec3> sphere_vertices;
 std::vector<glm::vec2> sphere_tex_coord;
@@ -72,20 +73,28 @@ int tess_num;
 float old_time, cur_time, delta_time;
 
 // CUDA stuff
-float *d_pos, *d_dir, *d_vel, *d_col;
-__constant__ int d_hair_density[1], d_hair_seg_num[1];
-__constant__ float d_hair_seg_length[1], d_hair_stiff[1], d_gravity[1], d_damping[1], d_wind[3];
-__constant__ float d_dt[1], d_box_size[1];
+cudaError error;
+void *d_pos, *d_dir, *d_vel, *d_col;
+float *d_init_pos;
 __constant__ float d_sphere_center[3];
-__constant__ float d_init_pos[960 * 3 * 3];
+__constant__ float d_wind[3];
+__constant__ float d_cur_time[1];
+
+// vbo variables
+GLuint vbo_pos, vbo_dir, vbo_vel, vbo_col, vbo_idx;
+struct cudaGraphicsResource *vbo_res[4];
+size_t pos_size, dir_size, vel_size, col_size;
 
 // hair data
-GLfloat pos[960][MAX_TESS][MAX_SEG_NUM][3];
-GLfloat dir[960][MAX_TESS][MAX_SEG_NUM][3];
-GLfloat vel[960][MAX_TESS][MAX_SEG_NUM][3];
-GLfloat col[960][MAX_TESS][MAX_SEG_NUM][3];
+GLfloat pos[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3];
+GLfloat dir[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3];
+GLfloat vel[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3];
+GLfloat col[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3];
+GLint vert_idx[TRIANGLE_NUM * TESS_NUM * (MAX_SEG_NUM + 1)];
 
-GLfloat init_pos[960][3][3];
+
+GLfloat init_pos[TRIANGLE_NUM][TESS_NUM][3];
+float axis[TESS_NUM][2];
 
 void compute_hair();
 
@@ -93,13 +102,7 @@ void Cleanup(bool noError)
 {
 	cudaError_t error;
 	// Free device memory
-	if (d_pos) error = cudaFree(d_pos);
-	if (!noError || error != cudaSuccess) printf("Something failed \n");
-	if (d_dir) error = cudaFree(d_dir);
-	if (!noError || error != cudaSuccess) printf("Something failed \n");
-	if (d_vel) error = cudaFree(d_vel);
-	if (!noError || error != cudaSuccess) printf("Something failed \n");
-	if (d_col) error = cudaFree(d_col);
+	if (d_init_pos) error = cudaFree(d_init_pos);
 	if (!noError || error != cudaSuccess) printf("Something failed \n");
 }
 
@@ -183,6 +186,28 @@ void load_obj(const char* filename, std::vector<glm::vec3> &vertices, std::vecto
 	sphere_tri_num = vertexIndices.size() / 3;
 }
 
+void createVBO(GLfloat data[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3], GLuint *vbo, struct cudaGraphicsResource **vbo_res, void** d_ptr, unsigned int vbo_res_flags) {
+	cudaError_t error;
+
+	// create buffer object
+	glGenBuffers(1, vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, *vbo);
+	// initialize buffer objects
+	glBufferData(GL_ARRAY_BUFFER, TRIANGLE_NUM * TESS_NUM * MAX_SEG_NUM * 3 * sizeof(float), data, GL_DYNAMIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+	error = cudaGraphicsGLRegisterBuffer(vbo_res, *vbo, vbo_res_flags);
+	if (error != cudaSuccess) printf("Something went wrong (RegisterBuffer): %s\n", cudaGetErrorString(error));
+
+	size_t size;
+	error = cudaGraphicsMapResources(1, vbo_res, NULL);
+	if (error != cudaSuccess) printf("Something went wrong (MapResources): %i\n", error);
+	error = cudaGraphicsResourceGetMappedPointer(d_ptr, &size, *vbo_res);
+	if (error != cudaSuccess) printf("Something went wrong (GetMappedPointer): %i\n", error);
+	error = cudaGraphicsUnmapResources(1, vbo_res, NULL);
+	if (error != cudaSuccess) printf("Something went wrong (UnmapResources): %i\n", error);
+}
+
 void draw_box()
 {
 	glEnable(GL_LIGHTING);
@@ -241,13 +266,14 @@ void draw_gui()
 {
 	ImGui_ImplGlut_NewFrame();
 
-	ImGui::SliderInt("Hair Density", &hair_density, 1, MAX_DENSITY);
-	ImGui::SliderFloat("Hair Segment Length", &hair_seg_length, 0.005f, 0.1f);
-	ImGui::SliderInt("Hair Segment Number", &hair_seg_num, 1, MAX_SEG_NUM - 1);
-	ImGui::SliderFloat("Hair Stiffness", &hair_stiff, 0.5f, 5.0f);
-	ImGui::SliderFloat("Gravity", &gravity, 0.0f, 1.0f);
-	ImGui::SliderFloat("Damping", &damping, 0.0f, 0.4f);
-	ImGui::SliderFloat3("Wind", wind, -1.0f, 1.0f);
+	//ImGui::SliderFloat("Hair Segment Length", &hair_seg_length, 0.001f, 0.01f);
+	ImGui::SliderFloat("Hair Stiffness", &hair_stiff, 5.0f, 24.0f);
+	ImGui::SliderFloat("Gravity", &gravity, 0.0f, 0.1f);
+	ImGui::SliderFloat("Damping", &damping, 0.0f, 0.005f);
+	ImGui::SliderFloat3("Wind", wind, -0.2f, 0.2f);
+	ImGui::Text("WASDQE: Camera Control     "); ImGui::SameLine(); ImGui::Text("F: Enable/Disable Forces on the Sphere  ");
+	ImGui::Text("IJKLUO: Sphere Control     "); ImGui::SameLine(); ImGui::Text("Space: Sphere Jump (When Forces Enabled)");
+	ImGui::Text("T: Quit                    "); ImGui::SameLine(); ImGui::Text("R: Reset Wind");
 
 	ImGui::Render();
 }
@@ -272,299 +298,280 @@ void Init(void)
 	glLightModelf(GL_LIGHT_MODEL_AMBIENT, 0.1f);
 
 	load_obj("sphere.obj", sphere_vertices, sphere_tex_coord, sphere_normals);
+
+	// weights for tessellation
+	int count = 0;
+	for (int i = 0; i <= DENSITY; i++)
+	{
+		for (int j = 0; j <= DENSITY - i; j++)
+		{
+			axis[count][0] = (float)i / (float)DENSITY;
+			axis[count][1] = (float)j / (float)DENSITY;
+			count++;
+		}
+	}
 	
 	glm::vec3 hair_color = glm::vec3(0.0f, 0.0f, 1.0f);
+	float dir_len;
 	for (int tri = 0; tri < sphere_tri_num; tri++)
 	{
-		for (int tess = 0; tess < 3; tess++)
+		for (int tess = 0; tess < TESS_NUM; tess++)
 		{
-			float dir_len = sqrt(sphere_normals[3 * tri + tess][0] * sphere_normals[3 * tri + tess][0] + 
-				sphere_normals[3 * tri + tess][1] * sphere_normals[3 * tri + tess][1] + 
-				sphere_normals[3 * tri + tess][2] * sphere_normals[3 * tri + tess][2]);
 			for (int k = 0; k < 3; k++)
 			{
-				pos[tri][tess][0][k] = sphere_vertices[3 * tri + tess][k];
-				dir[tri][tess][0][k] = sphere_normals[3 * tri + tess][k] / dir_len;
+				pos[tri][tess][0][k] = sphere_vertices[3 * tri][k]
+					+ axis[tess][0] * (sphere_vertices[3 * tri + 1][k] - sphere_vertices[3 * tri][k])
+					+ axis[tess][1] * (sphere_vertices[3 * tri + 2][k] - sphere_vertices[3 * tri][k]);
+				dir[tri][tess][0][k] = (sphere_normals[3 * tri][k]
+					+ axis[tess][0] * (sphere_normals[3 * tri + 1][k] - sphere_normals[3 * tri][k])
+					+ axis[tess][1] * (sphere_normals[3 * tri + 2][k] - sphere_normals[3 * tri][k]));
 				vel[tri][tess][0][k] = 0.0f;
 				col[tri][tess][0][k] = hair_color[k];
-
-				init_pos[tri][tess][k] = sphere_vertices[3 * tri + tess][k];
+				init_pos[tri][tess][k] = pos[tri][tess][0][k];
 			}
+			dir_len = sqrt(dir[tri][tess][0][0] * dir[tri][tess][0][0] +
+				dir[tri][tess][0][1] * dir[tri][tess][0][1] +
+				dir[tri][tess][0][2] * dir[tri][tess][0][2]);
+			dir[tri][tess][0][0] /= dir_len;
+			dir[tri][tess][0][1] /= dir_len;
+			dir[tri][tess][0][2] /= dir_len;
 			for (int seg = 1; seg < MAX_SEG_NUM; seg++)
 			{
 				for (int k = 0; k < 3; k++)
 				{
-					pos[tri][tess][seg][k] = pos[tri][tess][seg-1][k] + hair_seg_length * sphere_normals[3 * tri + tess][k];
+					pos[tri][tess][seg][k] = pos[tri][tess][seg-1][k] + hair_seg_length * dir[tri][tess][0][k];
 					dir[tri][tess][seg][k] = dir[tri][tess][0][k];
 					vel[tri][tess][seg][k] = 0.0f;
-					col[tri][tess][seg][k] = hair_color[k];
+					col[tri][tess][seg][k] = col[tri][tess][seg - 1][k] + (1.0f - hair_color[k]) / MAX_SEG_NUM;
 				}
 			}
 		}
 	}
 
-	cur_time = clock() / CLK_TCK;
+	// create vbo
+	createVBO(pos, &vbo_pos, &vbo_res[0], &d_pos, cudaGraphicsMapFlagsNone);
+	createVBO(dir, &vbo_dir, &vbo_res[1], &d_dir, cudaGraphicsMapFlagsNone);
+	createVBO(vel, &vbo_vel, &vbo_res[2], &d_vel, cudaGraphicsMapFlagsNone);
+	createVBO(col, &vbo_col, &vbo_res[3], &d_col, cudaGraphicsMapFlagsNone);
+
+	// indices vbo
+	count = 0;
+	for (int i = 0; i < TRIANGLE_NUM; i++)
+	{
+		for (int j = 0; j < TESS_NUM; j++)
+		{
+			for (int k = 0; k < MAX_SEG_NUM; k++)
+			{
+				vert_idx[count] = i * TESS_NUM * MAX_SEG_NUM + j * MAX_SEG_NUM + k;
+				count++;
+			}
+			vert_idx[count] = -1;
+			count++;
+		}
+	}
+	glGenBuffers(1, &vbo_idx);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vbo_idx);
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLshort) * TRIANGLE_NUM * TESS_NUM * (MAX_SEG_NUM + 1), vert_idx, GL_DYNAMIC_DRAW);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+	cudaError error;
+
+	error = cudaMalloc((void**)&d_init_pos, TRIANGLE_NUM * TESS_NUM * 3 * sizeof(float));
+	if (error != cudaSuccess) { printf("could not allocate on device (sphere_init_pos)\n"); Cleanup(false); }
+	error = cudaMemcpy(d_init_pos, init_pos, TRIANGLE_NUM * TESS_NUM * 3 * sizeof(float), cudaMemcpyHostToDevice);
+	if (error != cudaSuccess) { printf("could not copy to device (sphere_init_pos)\n"); Cleanup(false); }
 }
 
 __global__ void HairKernel(
-	float pos[960 * MAX_TESS * MAX_SEG_NUM][3],
-	float dir[960 * MAX_TESS * MAX_SEG_NUM][3],
-	float vel[960 * MAX_TESS * MAX_SEG_NUM][3],
-	float col[960 * MAX_TESS * MAX_SEG_NUM][3])
+	float pos[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3],
+	float dir[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3],
+	float vel[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3],
+	float col[TRIANGLE_NUM][TESS_NUM][MAX_SEG_NUM][3],
+	float init_pos[TRIANGLE_NUM][TESS_NUM][3],
+	float hair_seg_length,
+	int hair_seg_num,
+	float hair_stiff,
+	float gravity,
+	float damping,
+	float dt,
+	float box_size)
 {
 	int i = blockDim.x*blockIdx.x + threadIdx.x;
 	int j = blockDim.y*blockIdx.y + threadIdx.y;
-	int tess_num = (d_hair_density[0] + 1) * (d_hair_density[0] + 2) / 2;
-	if ((i >= 960) || (j >= tess_num)) return;
+	if ((i >= TRIANGLE_NUM) || (j >= TESS_NUM)) return;
 	
 	// sphere position
-	if (j < 3)
-	{
-		pos[i * MAX_TESS * MAX_SEG_NUM + j * MAX_SEG_NUM][0] = d_sphere_center[0] + d_init_pos[i * 9 + j * 3];
-		pos[i * MAX_TESS * MAX_SEG_NUM + j * MAX_SEG_NUM][1] = d_sphere_center[1] + d_init_pos[i * 9 + j * 3 + 1];
-		pos[i * MAX_TESS * MAX_SEG_NUM + j * MAX_SEG_NUM][2] = d_sphere_center[2] + d_init_pos[i * 9 + j * 3 + 2];
-	}
-	// compute the tessellation
-	else if (j > 2)
-	{
-		int tri_idx = i * MAX_TESS * MAX_SEG_NUM;
-		int tess_idx = 2;
-		float axis1, axis2;
-		//find coord
-		for (int a1 = 0; a1 <= d_hair_density[0]; a1++)
-		{
-			for (int a2 = 0; a2 <= d_hair_density[0] - a1; a2++)
-			{
-				if ((a1 + a2 > 0) && !(a1==0 && a2== d_hair_density[0]) && !(a1== d_hair_density[0] && a2==0))
-				{
-					tess_idx++;
-					if (tess_idx == j)
-					{
-						axis1 = (float)a1;
-						axis2 = (float)a2;
-						break;
-					}
-				}
-			}
-			if (tess_idx == j)
-				break;
-		}
-		axis1 /= d_hair_density[0];
-		axis2 /= d_hair_density[0];
-		// interpolate
-		for (int k = 0; k < 3; k++)
-		{
-			pos[tri_idx + j * MAX_SEG_NUM][k] = pos[tri_idx][k]
-				+ axis1 * (pos[tri_idx + MAX_SEG_NUM][k] - pos[tri_idx][k])
-				+ axis2 * (pos[tri_idx + 2 * MAX_SEG_NUM][k] - pos[tri_idx][k]);
-			dir[tri_idx + j * MAX_SEG_NUM][k] = dir[tri_idx][k]
-				+ axis1 * (dir[tri_idx + MAX_SEG_NUM][k] - dir[tri_idx][k])
-				+ axis2 * (dir[tri_idx + 2 * MAX_SEG_NUM][k] - dir[tri_idx][k]);
-			vel[tri_idx + j * MAX_SEG_NUM][k] = vel[tri_idx][k]
-				+ axis1 * (vel[tri_idx + MAX_SEG_NUM][k] - vel[tri_idx][k])
-				+ axis2 * (vel[tri_idx + 2 * MAX_SEG_NUM][k] - vel[tri_idx][k]);
-			col[tri_idx + j * MAX_SEG_NUM][k] = col[tri_idx][k]
-				+ axis1 * (col[tri_idx + MAX_SEG_NUM][k] - col[tri_idx][k])
-				+ axis2 * (col[tri_idx + 2 * MAX_SEG_NUM][k] - col[tri_idx][k]);
-		}
-	}
+	pos[i][j][0][0] = d_sphere_center[0] + init_pos[i][j][0];
+	pos[i][j][0][1] = d_sphere_center[1] + init_pos[i][j][1];
+	pos[i][j][0][2] = d_sphere_center[2] + init_pos[i][j][2];
+
 	// compute the segments
-	float theo_pos[3], f_spring[3], v[3] = { 0.0f, 0.0f, 0.0f }, cur_len, dir_len;
-	int idx;
-	for (int s = 1; s < d_hair_seg_num[0]; s++)
+	float theo_pos[3], f_spring[3], v[3] = { 0.0f, 0.0f, 0.0f }, cur_len, theo_len, dir_len;
+	for (int s = 1; s < hair_seg_num; s++)
 	{
-		idx = i * MAX_TESS * MAX_SEG_NUM + j * MAX_SEG_NUM + s;
-		cur_len = sqrt((pos[idx][0] - pos[idx - 1][0]) * (pos[idx][0] - pos[idx - 1][0]) +
-			(pos[idx][1] - pos[idx - 1][1]) * (pos[idx][1] - pos[idx - 1][1]) + 
-			(pos[idx][2] - pos[idx - 1][2]) * (pos[idx][2] - pos[idx - 1][2]));
-		theo_pos[0] = pos[idx - 1][0] + d_hair_seg_length[0] * dir[idx - 1][0];
-		theo_pos[1] = pos[idx - 1][1] + d_hair_seg_length[0] * dir[idx - 1][1];
-		theo_pos[2] = pos[idx - 1][2] + d_hair_seg_length[0] * dir[idx - 1][2];
-		f_spring[0] = (theo_pos[0] - pos[idx][0]) + (d_hair_seg_length[0] - cur_len) * (pos[idx][0] - pos[idx - 1][0]);
-		f_spring[1] = (theo_pos[1] - pos[idx][1]) + (d_hair_seg_length[0] - cur_len) * (pos[idx][1] - pos[idx - 1][1]);
-		f_spring[2] = (theo_pos[2] - pos[idx][2]) + (d_hair_seg_length[0] - cur_len) * (pos[idx][2] - pos[idx - 1][2]);
+		cur_len = sqrt((pos[i][j][s][0] - pos[i][j][s - 1][0]) * (pos[i][j][s][0] - pos[i][j][s - 1][0]) +
+			(pos[i][j][s][1] - pos[i][j][s - 1][1]) * (pos[i][j][s][1] - pos[i][j][s - 1][1]) +
+			(pos[i][j][s][2] - pos[i][j][s - 1][2]) * (pos[i][j][s][2] - pos[i][j][s - 1][2]));
+		theo_pos[0] = pos[i][j][s - 1][0] + hair_seg_length * dir[i][j][s - 1][0];
+		theo_pos[1] = pos[i][j][s - 1][1] + hair_seg_length * dir[i][j][s - 1][1];
+		theo_pos[2] = pos[i][j][s - 1][2] + hair_seg_length * dir[i][j][s - 1][2];
+		f_spring[0] = 10.0f * (theo_pos[0] - pos[i][j][s][0]) + (hair_seg_length - cur_len) * (pos[i][j][s][0] - pos[i][j][s - 1][0]);
+		f_spring[1] = 10.0f * (theo_pos[1] - pos[i][j][s][1]) + (hair_seg_length - cur_len) * (pos[i][j][s][1] - pos[i][j][s - 1][1]);
+		f_spring[2] = 10.0f * (theo_pos[2] - pos[i][j][s][2]) + (hair_seg_length - cur_len) * (pos[i][j][s][2] - pos[i][j][s - 1][2]);
+
 		// bending
-		if (s < d_hair_seg_num[0] - 1)
+		if (s < hair_seg_num - 1)
 		{
-			f_spring[0] += (pos[idx - 1][0] - pos[idx][0]) + (pos[idx + 1][0] - pos[idx][0]);
-			f_spring[1] += (pos[idx - 1][1] - pos[idx][1]) + (pos[idx + 1][1] - pos[idx][1]);
-			f_spring[2] += (pos[idx - 1][2] - pos[idx][2]) + (pos[idx + 1][2] - pos[idx][2]);
+			f_spring[0] += (pos[i][j][s - 1][0] - pos[i][j][s][0]) + (pos[i][j][s + 1][0] - pos[i][j][s][0]);
+			f_spring[1] += (pos[i][j][s - 1][1] - pos[i][j][s][1]) + (pos[i][j][s + 1][1] - pos[i][j][s][1]);
+			f_spring[2] += (pos[i][j][s - 1][2] - pos[i][j][s][2]) + (pos[i][j][s + 1][2] - pos[i][j][s][2]);
 		}
 
-		v[0] = vel[idx][0] * d_damping[0];
-		v[1] = vel[idx][1] * d_damping[0];
-		v[2] = vel[idx][2] * d_damping[0];
-		v[0] += (d_hair_stiff[0] * f_spring[0] + abs(sinf(100.0f * d_dt[0] + pos[idx][1]) * d_wind[0])) * d_dt[0];
-		v[1] += (d_hair_stiff[0] * f_spring[1] - (d_hair_seg_num[0] - s) * d_gravity[0] + 
-			abs(sinf(100.0f * d_dt[0] + pos[idx][2]) * d_wind[1])) * d_dt[0];
-		v[2] += (d_hair_stiff[0] * f_spring[2] + abs(sinf(100.0f * d_dt[0] + pos[idx][0]) * d_wind[2])) * d_dt[0];
+		v[0] = vel[i][j][s][0] * damping;
+		v[1] = vel[i][j][s][1] * damping;
+		v[2] = vel[i][j][s][2] * damping;
+		v[0] += (hair_stiff * f_spring[0] + abs(cosf(d_cur_time[0] + s - j)) * d_wind[0]) * dt;
+		v[1] += (hair_stiff * f_spring[1] - gravity + abs(sinf(d_cur_time[0] - s - j)) * d_wind[1]) * dt;
+		v[2] += (hair_stiff * f_spring[2] + abs(sinf(d_cur_time[0] + s + i)) * d_wind[2]) * dt;
 		
-		v[0] *= d_damping[0];
-		v[1] *= d_damping[0];
-		v[2] *= d_damping[0];
+		v[0] *= damping;
+		v[1] *= damping;
+		v[2] *= damping;
 
-		pos[idx][0] = pos[idx][0] + v[0];
-		pos[idx][1] = pos[idx][1] + v[1];
-		pos[idx][2] = pos[idx][2] + v[2];
-		vel[idx][0] = v[0];
-		vel[idx][1] = v[1];
-		vel[idx][2] = v[2];
+		theo_pos[0] = pos[i][j][s][0] + v[0];
+		theo_pos[1] = pos[i][j][s][1] + v[1];
+		theo_pos[2] = pos[i][j][s][2] + v[2];
+		theo_len = sqrt((theo_pos[0] - pos[i][j][s - 1][0]) * (theo_pos[0] - pos[i][j][s - 1][0]) + 
+			(theo_pos[1] - pos[i][j][s - 1][1]) * (theo_pos[1] - pos[i][j][s - 1][1]) + 
+			(theo_pos[2] - pos[i][j][s - 1][2]) * (theo_pos[2] - pos[i][j][s - 1][2]));
+
+		pos[i][j][s][0] = pos[i][j][s - 1][0] + hair_seg_length * (theo_pos[0] - pos[i][j][s - 1][0]) / theo_len;
+		pos[i][j][s][1] = pos[i][j][s - 1][1] + hair_seg_length * (theo_pos[1] - pos[i][j][s - 1][1]) / theo_len;
+		pos[i][j][s][2] = pos[i][j][s - 1][2] + hair_seg_length * (theo_pos[2] - pos[i][j][s - 1][2]) / theo_len;
+
+		vel[i][j][s][0] = v[0];
+		vel[i][j][s][1] = v[1];
+		vel[i][j][s][2] = v[2];
 
 		// collision with the sphere
-		if ((pos[idx][0] - d_sphere_center[0]) * (pos[idx][0] - d_sphere_center[0]) +
-			(pos[idx][1] - d_sphere_center[1]) * (pos[idx][1] - d_sphere_center[1]) +
-			(pos[idx][2] - d_sphere_center[2]) * (pos[idx][2] - d_sphere_center[2]) <= 1.0f)
+		if ((pos[i][j][s][0] - d_sphere_center[0]) * (pos[i][j][s][0] - d_sphere_center[0]) +
+			(pos[i][j][s][1] - d_sphere_center[1]) * (pos[i][j][s][1] - d_sphere_center[1]) +
+			(pos[i][j][s][2] - d_sphere_center[2]) * (pos[i][j][s][2] - d_sphere_center[2]) <= 1.0f)
 		{
-			pos[idx][0] = d_sphere_center[0] + 1.00001f * (pos[idx][0] - d_sphere_center[0]) / 
-				sqrtf((pos[idx][0] - d_sphere_center[0]) * (pos[idx][0] - d_sphere_center[0]) +
-				(pos[idx][1] - d_sphere_center[1]) * (pos[idx][1] - d_sphere_center[1]) +
-				(pos[idx][2] - d_sphere_center[2]) * (pos[idx][2] - d_sphere_center[2]) + 0.000001);
-			vel[idx][0] += (1.0f + d_damping[0]) * (vel[idx][0] * (pos[idx][0] - d_sphere_center[0]) +
-				vel[idx][1] * (pos[idx][1] - d_sphere_center[1]) +
-				vel[idx][2] * (pos[idx][2] - d_sphere_center[2])) * (pos[idx][0] - d_sphere_center[0]);
-			pos[idx][1] = d_sphere_center[1] + 1.00001f * (pos[idx][1] - d_sphere_center[1]) /
-				sqrtf((pos[idx][0] - d_sphere_center[0]) * (pos[idx][0] - d_sphere_center[0]) +
-				(pos[idx][1] - d_sphere_center[1]) * (pos[idx][1] - d_sphere_center[1]) +
-					(pos[idx][2] - d_sphere_center[2]) * (pos[idx][2] - d_sphere_center[2]) + 0.000001);
-			vel[idx][1] += (1.0f + d_damping[0]) * (vel[idx][0] * (pos[idx][0] - d_sphere_center[0]) +
-				vel[idx][1] * (pos[idx][1] - d_sphere_center[1]) +
-				vel[idx][2] * (pos[idx][2] - d_sphere_center[2])) * (pos[idx][1] - d_sphere_center[1]);
-			pos[idx][2] = d_sphere_center[2] + 1.00001f * (pos[idx][2] - d_sphere_center[2]) /
-				sqrtf((pos[idx][0] - d_sphere_center[0]) * (pos[idx][0] - d_sphere_center[0]) +
-				(pos[idx][1] - d_sphere_center[1]) * (pos[idx][1] - d_sphere_center[1]) +
-					(pos[idx][2] - d_sphere_center[2]) * (pos[idx][2] - d_sphere_center[2]) + 0.000001);
-			vel[idx][2] += (1.0f + d_damping[0]) * (vel[idx][0] * (pos[idx][0] - d_sphere_center[0]) +
-				vel[idx][1] * (pos[idx][1] - d_sphere_center[1]) +
-				vel[idx][2] * (pos[idx][2] - d_sphere_center[2])) * (pos[idx][2] - d_sphere_center[2]);
+			pos[i][j][s][0] = d_sphere_center[0] + 1.00001f * (pos[i][j][s][0] - d_sphere_center[0]) /
+				sqrtf((pos[i][j][s][0] - d_sphere_center[0]) * (pos[i][j][s][0] - d_sphere_center[0]) +
+				(pos[i][j][s][1] - d_sphere_center[1]) * (pos[i][j][s][1] - d_sphere_center[1]) +
+				(pos[i][j][s][2] - d_sphere_center[2]) * (pos[i][j][s][2] - d_sphere_center[2]) + 0.000001);
+			vel[i][j][s][0] += (1.0f + damping) * (vel[i][j][s][0] * (pos[i][j][s][0] - d_sphere_center[0]) +
+				vel[i][j][s][1] * (pos[i][j][s][1] - d_sphere_center[1]) +
+				vel[i][j][s][2] * (pos[i][j][s][2] - d_sphere_center[2])) * (pos[i][j][s][0] - d_sphere_center[0]);
+			pos[i][j][s][1] = d_sphere_center[1] + 1.00001f * (pos[i][j][s][1] - d_sphere_center[1]) /
+				sqrtf((pos[i][j][s][0] - d_sphere_center[0]) * (pos[i][j][s][0] - d_sphere_center[0]) +
+				(pos[i][j][s][1] - d_sphere_center[1]) * (pos[i][j][s][1] - d_sphere_center[1]) +
+					(pos[i][j][s][2] - d_sphere_center[2]) * (pos[i][j][s][2] - d_sphere_center[2]) + 0.000001);
+			vel[i][j][s][1] += (1.0f + damping) * (vel[i][j][s][0] * (pos[i][j][s][0] - d_sphere_center[0]) +
+				vel[i][j][s][1] * (pos[i][j][s][1] - d_sphere_center[1]) +
+				vel[i][j][s][2] * (pos[i][j][s][2] - d_sphere_center[2])) * (pos[i][j][s][1] - d_sphere_center[1]);
+			pos[i][j][s][2] = d_sphere_center[2] + 1.00001f * (pos[i][j][s][2] - d_sphere_center[2]) /
+				sqrtf((pos[i][j][s][0] - d_sphere_center[0]) * (pos[i][j][s][0] - d_sphere_center[0]) +
+				(pos[i][j][s][1] - d_sphere_center[1]) * (pos[i][j][s][1] - d_sphere_center[1]) +
+					(pos[i][j][s][2] - d_sphere_center[2]) * (pos[i][j][s][2] - d_sphere_center[2]) + 0.000001);
+			vel[i][j][s][2] += (1.0f + damping) * (vel[i][j][s][0] * (pos[i][j][s][0] - d_sphere_center[0]) +
+				vel[i][j][s][1] * (pos[i][j][s][1] - d_sphere_center[1]) +
+				vel[i][j][s][2] * (pos[i][j][s][2] - d_sphere_center[2])) * (pos[i][j][s][2] - d_sphere_center[2]);
 		}
 
 		// collide with the box
-		if (pos[idx][0] >= d_box_size[0])
+		if (pos[i][j][s][0] >= box_size)
 		{
-			pos[idx][0] = d_box_size[0];
-			vel[idx][0] = -1.0f * d_damping[0] * abs(vel[idx][0]);
+			pos[i][j][s][0] = box_size;
+			vel[i][j][s][0] = -1.0f * damping * abs(vel[i][j][s][0]);
 		}
-		else if (pos[idx][0] <= -1.0f * d_box_size[0])
+		else if (pos[i][j][s][0] <= -1.0f * box_size)
 		{
-			pos[idx][0] = -1.0f * d_box_size[0];
-			vel[idx][0] = d_damping[0] * abs(vel[idx][0]);
+			pos[i][j][s][0] = -1.0f * box_size;
+			vel[i][j][s][0] = damping * abs(vel[i][j][s][0]);
 		}
-		if (pos[idx][1] >= d_box_size[0])
+		if (pos[i][j][s][1] >= box_size)
 		{
-			pos[idx][1] = d_box_size[0];
-			vel[idx][1] = -1.0f * d_damping[0] * abs(vel[idx][1]);
+			pos[i][j][s][1] = box_size;
+			vel[i][j][s][1] = -1.0f * damping * abs(vel[i][j][s][1]);
 		}
-		else if (pos[idx][1] <= -1.0f * d_box_size[0])
+		else if (pos[i][j][s][1] <= -1.0f * box_size)
 		{
-			pos[idx][1] = -1.0f * d_box_size[0];
-			vel[idx][1] = d_damping[0] * abs(vel[idx][1]);
+			pos[i][j][s][1] = -1.0f * box_size;
+			vel[i][j][s][1] = damping * abs(vel[i][j][s][1]);
 		}
-		if (pos[idx][2] >= d_box_size[0])
+		if (pos[i][j][s][2] >= box_size)
 		{
-			pos[idx][2] = d_box_size[0];
-			vel[idx][2] = -1.0f * d_damping[0] * abs(vel[idx][2]);
+			pos[i][j][s][2] = box_size;
+			vel[i][j][s][2] = -1.0f * damping * abs(vel[i][j][s][2]);
 		}
-		else if (pos[idx][2] <= -1.0f * d_box_size[0])
+		else if (pos[i][j][s][2] <= -1.0f * box_size)
 		{
-			pos[idx][2] = -1.0f * d_box_size[0];
-			vel[idx][2] = d_damping[0] * abs(vel[idx][2]);
+			pos[i][j][s][2] = -1.0f * box_size;
+			vel[i][j][s][2] = damping * abs(vel[i][j][s][2]);
 		}
 
-		dir[idx][0] = pos[idx][0] - pos[idx - 1][0];
-		dir[idx][1] = pos[idx][1] - pos[idx - 1][1];
-		dir[idx][2] = pos[idx][2] - pos[idx - 1][2];
-		dir_len = sqrt(dir[idx][0] * dir[idx][0] + dir[idx][1] * dir[idx][1] + dir[idx][2] * dir[idx][2]) + 0.000001;
-		dir[idx][0] /= dir_len;
-		dir[idx][1] /= dir_len;
-		dir[idx][2] /= dir_len;
-		col[idx][0] = col[idx - 1][0];
-		col[idx][1] = col[idx - 1][1];
-		col[idx][2] = col[idx - 1][2];
+		dir[i][j][s][0] = pos[i][j][s][0] - pos[i][j][s - 1][0];
+		dir[i][j][s][1] = pos[i][j][s][1] - pos[i][j][s - 1][1];
+		dir[i][j][s][2] = pos[i][j][s][2] - pos[i][j][s - 1][2];
+		dir_len = sqrt(dir[i][j][s][0] * dir[i][j][s][0] + dir[i][j][s][1] * dir[i][j][s][1] + dir[i][j][s][2] * dir[i][j][s][2]) + 0.000001;
+		dir[i][j][s][0] /= dir_len;
+		dir[i][j][s][1] /= dir_len;
+		dir[i][j][s][2] /= dir_len;
+		/*col[i][j][s][0] = col[i][j][s - 1][0];
+		col[i][j][s][1] = col[i][j][s - 1][1];
+		col[i][j][s][2] = col[i][j][s - 1][2];*/
 	}
 }
 
 void compute_hair()
 {
 	cudaError_t error;
-	int size_info = 960 * MAX_TESS * MAX_SEG_NUM * 3 * sizeof(float);
-	// allocate space
-	error = cudaMalloc((void**)&d_pos, size_info);
-	if (error != cudaSuccess) Cleanup(false);
-	error = cudaMalloc((void**)&d_dir, size_info);
-	if (error != cudaSuccess) Cleanup(false);
-	error = cudaMalloc((void**)&d_vel, size_info);
-	if (error != cudaSuccess) Cleanup(false);
-	error = cudaMalloc((void**)&d_col, size_info);
-	if (error != cudaSuccess) Cleanup(false);
-	// copy data
-	error = cudaMemcpy(d_pos, pos, size_info, cudaMemcpyHostToDevice);
-	if (error != cudaSuccess) { printf("could not copy to device (pos)\n"); Cleanup(false); }
-	error = cudaMemcpy(d_dir, dir, size_info, cudaMemcpyHostToDevice);
-	if (error != cudaSuccess) { printf("could not copy to device (dir)\n"); Cleanup(false); }
-	error = cudaMemcpy(d_vel, vel, size_info, cudaMemcpyHostToDevice);
-	if (error != cudaSuccess) { printf("could not copy to device (vel)\n"); Cleanup(false); }
-	error = cudaMemcpy(d_col, col, size_info, cudaMemcpyHostToDevice);
-	if (error != cudaSuccess) { printf("could not copy to device (col)\n"); Cleanup(false); }
-	// copy constant data
-	error = cudaMemcpyToSymbol(d_hair_density, &hair_density, sizeof(int));
-	if (error != cudaSuccess) { printf("could not copy to device (density)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_hair_seg_length, &hair_seg_length, sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (seg_len)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_hair_seg_num, &hair_seg_num, sizeof(int));
-	if (error != cudaSuccess) { printf("could not copy to device (seg_num)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_hair_stiff, &hair_stiff, sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (stiff)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_gravity, &gravity, sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (gravity)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_damping, &damping, sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (damping)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_wind, wind, 3 * sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (wind)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_dt, &delta_time, sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (dt)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_box_size, &box_size, sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (box_size)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_sphere_center, sphere_center, 3 * sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (sphere_center)\n"); Cleanup(false); }
-	error = cudaMemcpyToSymbol(d_init_pos, init_pos, 960 * 3 * 3 * sizeof(float));
-	if (error != cudaSuccess) { printf("could not copy to device (sphere_init_pos)\n"); Cleanup(false); }
-
 
 	//prepare blocks and grid
 	const int BLOCKSIZE = 16;
 	dim3 dimBlock(BLOCKSIZE, BLOCKSIZE);
 	dim3 dimGrid(ceil((float)sphere_tri_num / dimBlock.x),
-		ceil((float)MAX_TESS / dimBlock.y));
+		ceil((float)TESS_NUM / dimBlock.y));
+
+	// update sphere center and wind
+	error = cudaMemcpyToSymbol(d_sphere_center, sphere_center, 3 * sizeof(float));
+	if (error != cudaSuccess) { printf("could not copy to device (sphere_center)\n"); Cleanup(false); }
+	error = cudaMemcpyToSymbol(d_wind, wind, 3 * sizeof(float));
+	if (error != cudaSuccess) { printf("could not copy to device (wind)\n"); Cleanup(false); }
+	error = cudaMemcpyToSymbol(d_cur_time, &cur_time, sizeof(float));
+	if (error != cudaSuccess) { printf("could not copy to device (cur_time)\n"); Cleanup(false); }
+
 	// Invoke kernel
-	HairKernel <<<dimGrid, dimBlock >>> (
-		(float(*)[3])d_pos,
-		(float(*)[3])d_dir,
-		(float(*)[3])d_vel,
-		(float(*)[3])d_col);
+	error = cudaGraphicsMapResources(4, vbo_res, NULL);
+	if (error != cudaSuccess) printf("Something went wrong when mapping vbo: %i\n", error);
+	HairKernel << <dimGrid, dimBlock >> > (
+		(float(*)[TESS_NUM][MAX_SEG_NUM][3]) d_pos,
+		(float(*)[TESS_NUM][MAX_SEG_NUM][3]) d_dir,
+		(float(*)[TESS_NUM][MAX_SEG_NUM][3]) d_vel,
+		(float(*)[TESS_NUM][MAX_SEG_NUM][3]) d_col,
+		(float(*)[TESS_NUM][3]) d_init_pos,
+		hair_seg_length,
+		hair_seg_num,
+		hair_stiff,
+		gravity,
+		damping,
+		delta_time,
+		box_size);
 	error = cudaGetLastError();
-	if (error != cudaSuccess) printf("Something went wrong: %i\n", error);
-
-	error = cudaDeviceSynchronize();
-	if (error != cudaSuccess) { printf("synchronization is wrong\n"); Cleanup(false); }
-
-	error = cudaMemcpy(pos, d_pos, size_info, cudaMemcpyDeviceToHost);
-	if (error != cudaSuccess) { printf("could not copy from device (pos)\n"); Cleanup(false); }
-	error = cudaMemcpy(dir, d_dir, size_info, cudaMemcpyDeviceToHost);
-	if (error != cudaSuccess) { printf("could not copy from device (dir)\n"); Cleanup(false); }
-	error = cudaMemcpy(vel, d_vel, size_info, cudaMemcpyDeviceToHost);
-	if (error != cudaSuccess) { printf("could not copy from device (vel)\n"); Cleanup(false); }
-	error = cudaMemcpy(col, d_col, size_info, cudaMemcpyDeviceToHost);
-	if (error != cudaSuccess) { printf("could not copy from device (col)\n"); Cleanup(false); }
-
-	Cleanup(true);
+	if (error != cudaSuccess) printf("Something went wrong when executing kernel: %i\n", error);
+	cudaGraphicsUnmapResources(4, vbo_res, NULL);//sync!
+	error = cudaGetLastError();
+	if (error != cudaSuccess) printf("Something went wrong when unmapping vbo: %i\n", error);
 }
 
 void Idle(void)
 {
 	cur_time = clock() / CLK_TCK;
-	delta_time = (cur_time - old_time) / 10;
+	delta_time = 2;//(cur_time - old_time);
 	old_time = cur_time;
-	tess_num = (hair_density + 1) * (hair_density + 2) / 2;
 
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
@@ -582,17 +589,17 @@ void Idle(void)
 
 	if (sphere_force)
 	{
-		sphere_v[0] += wind[0] * delta_time;
-		sphere_v[1] += (-1.0f * gravity + wind[1]) * delta_time;
-		sphere_v[2] += wind[2] * delta_time;
+		sphere_v[0] += wind[0] * delta_time / sphere_weight;
+		sphere_v[1] += (-1.0f * gravity + wind[1]) * delta_time / sphere_weight;
+		sphere_v[2] += wind[2] * delta_time / sphere_weight;
 
-		sphere_center[0] += damping * sphere_v[0];
-		sphere_center[1] += damping * sphere_v[1];
-		sphere_center[2] += damping * sphere_v[2];
+		sphere_center[0] += sphere_v[0];
+		sphere_center[1] += sphere_v[1];
+		sphere_center[2] += sphere_v[2];
 
-		sphere_v[0] *= damping;
-		sphere_v[1] *= damping;
-		sphere_v[2] *= damping;
+		sphere_v[0] *= 0.9f;
+		sphere_v[1] *= 0.9f;
+		sphere_v[2] *= 0.9f;
 
 		if (sphere_center[0] > box_size - 1.0f)
 		{
@@ -635,27 +642,33 @@ void Idle(void)
 	compute_hair();
 
 	glDisable(GL_DEPTH_TEST);
-	for (int i = 0; i < sphere_tri_num; i++)
-	{
-		for (int j = 0; j < tess_num; j++)
-		{
-			glColor3f(1.0f, 0.0f, 1.0f);
-			glBegin(GL_LINE_STRIP);
-			for (int k = 0; k < hair_seg_num; k++)
-			{
-				glVertex3fv((GLfloat*)&pos[i][j][k]);
-			}
-			glEnd();
-			glColor3f(1.0f, 1.0f, 1.0f);
-			for (int k = 0; k < hair_seg_num; k++)
-			{
-				glBegin(GL_POINTS);
-				glVertex3fv((GLfloat*)&pos[i][j][k]);
-				glEnd();
-			}
-		}
-	}
+	glEnable(GL_PRIMITIVE_RESTART);
+	glPrimitiveRestartIndex(-1);
 
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vbo_idx);
+	glEnableClientState(GL_INDEX_ARRAY);
+	glIndexPointer(GL_INT, 0, 0);
+
+	glBindBuffer(GL_ARRAY_BUFFER, vbo_pos);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glVertexPointer(3, GL_FLOAT, 0, 0);
+
+	glBindBuffer(GL_ARRAY_BUFFER, vbo_col);
+	glEnableClientState(GL_COLOR_ARRAY);
+	glColorPointer(3, GL_FLOAT, 0, 0);
+
+	//glTexCoordPointer(2, GL_FLOAT, 0, 0);
+
+	glDrawElements(GL_LINE_STRIP, TRIANGLE_NUM * TESS_NUM * (MAX_SEG_NUM + 1), GL_UNSIGNED_INT, 0);
+
+	glDisableClientState(GL_INDEX_ARRAY);
+	glDisableClientState(GL_VERTEX_ARRAY);
+	glDisableClientState(GL_COLOR_ARRAY);
+
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+	glDisable(GL_PRIMITIVE_RESTART);
 	glEnable(GL_DEPTH_TEST);
 
 	draw_gui();
@@ -708,41 +721,66 @@ void Key(unsigned char key, GLint i, GLint j)
 	case 'i':
 	case 'I':
 		if (sphere_center[1] < box_size - 1.0f)
+		{
 			sphere_center[1] += 0.1f;
+		}
 		break;
 	case 'k':
 	case 'K':
 		if (sphere_center[1] > -1.0f * box_size + 1.0f)
+		{
 			sphere_center[1] -= 0.1f;
+		}
 		break;
 	case 'j':
 	case 'J':
 		if (sphere_center[0] > -1.0f * box_size + 1.0f)
+		{
 			sphere_center[0] -= 0.1f;
+		}
 		break;
 	case 'l':
 	case 'L':
 		if (sphere_center[0] < box_size - 1.0f)
+		{
 			sphere_center[0] += 0.1f;
+		}
 		break;
 	case 'u':
 	case 'U':
 		if (sphere_center[2] > -1.0f * box_size + 1.0f)
+		{
 			sphere_center[2] -= 0.1f;
+		}
 		break;
 	case 'o':
 	case 'O':
 		if (sphere_center[2] < box_size - 1.0f)
+		{
 			sphere_center[2] += 0.1f;
+		}
 		break;
 		// sphere force on/off
 	case 'f':
 	case 'F':
 		sphere_force = !sphere_force;
 		printf("sphere force: %d\n", sphere_force);
+		break;
 		// sphere jump
 	case ' ':
-		sphere_v[1] += 5.0f;
+		sphere_v[1] += gravity * sphere_weight;
+		break;
+	case 'r':
+	case'R':
+		wind[0] = 0.0f;
+		wind[1] = 0.0f;
+		wind[2] = 0.0f;
+		break;
+	case 't':
+	case 'T':
+		Cleanup(true);
+		cudaDeviceReset();
+		exit(0);
 	}
 	glutPostRedisplay();
 }
